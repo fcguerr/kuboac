@@ -11,11 +11,10 @@ ClimateTraits tclacClimate::traits() {
     // 1. Apenas a temperatura atual
     traits.add_feature_flags(climate::CLIMATE_SUPPORTS_CURRENT_TEMPERATURE);
 	
-    // 2. Modos suportados. O AUTO do protocolo TCL é exposto ao ESPHome
-    // como HEAT_COOL, tal como no upstream atual.
+    // 2. Modos suportados. Mantemos AUTO como AUTO no Home Assistant.
     traits.set_supported_modes({
         climate::CLIMATE_MODE_OFF,
-        climate::CLIMATE_MODE_HEAT_COOL,
+        climate::CLIMATE_MODE_AUTO,
         climate::CLIMATE_MODE_COOL,
         climate::CLIMATE_MODE_HEAT,
         climate::CLIMATE_MODE_DRY,
@@ -144,12 +143,12 @@ void tclacClimate::readData() {
 		uint8_t swingmodeswitch = SWING_MODE_MASK & dataRX[SWING_POS];
 
 		switch (modeswitch) {
-			case MODE_AUTO: mode = climate::CLIMATE_MODE_HEAT_COOL; break;
+			case MODE_AUTO: mode = climate::CLIMATE_MODE_AUTO; break;
 			case MODE_COOL: mode = climate::CLIMATE_MODE_COOL; break;
 			case MODE_DRY: mode = climate::CLIMATE_MODE_DRY; break;
 			case MODE_FAN_ONLY: mode = climate::CLIMATE_MODE_FAN_ONLY; break;
 			case MODE_HEAT: mode = climate::CLIMATE_MODE_HEAT; break;
-			default: mode = climate::CLIMATE_MODE_HEAT_COOL;
+			default: mode = climate::CLIMATE_MODE_AUTO;
 		}
 
 		if ( dataRX[FAN_QUIET_POS] & FAN_QUIET) {
@@ -284,12 +283,9 @@ void tclacClimate::takeControl() {
 			dataTX[7] += 0b00000000;
 			dataTX[8] += 0b00000000;
 			break;
-		case climate::CLIMATE_MODE_HEAT_COOL:
+		case climate::CLIMATE_MODE_AUTO:
 			dataTX[7] += 0b00000100;
 			dataTX[8] += 0b00001000;
-			break;
-		case climate::CLIMATE_MODE_AUTO:
-			// Não usado: o AUTO TCL é representado por HEAT_COOL.
 			break;
 		case climate::CLIMATE_MODE_COOL:
 			dataTX[7] += 0b00000100;
