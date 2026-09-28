@@ -11,9 +11,11 @@ ClimateTraits tclacClimate::traits() {
     // 1. Apenas a temperatura atual
     traits.add_feature_flags(climate::CLIMATE_SUPPORTS_CURRENT_TEMPERATURE);
 	
-    // 2. Modos Suportados (AUTO REMOVIDO)
+    // 2. Modos suportados. O AUTO do protocolo TCL é exposto ao ESPHome
+    // como HEAT_COOL, tal como no upstream atual.
     traits.set_supported_modes({
         climate::CLIMATE_MODE_OFF,
+        climate::CLIMATE_MODE_HEAT_COOL,
         climate::CLIMATE_MODE_COOL,
         climate::CLIMATE_MODE_HEAT,
         climate::CLIMATE_MODE_DRY,
@@ -71,12 +73,16 @@ void tclacClimate::setup() {
 
 void tclacClimate::loop() {
 	if (esphome::uart::UARTDevice::available() > 0) {
+		// A linha está ocupada a receber; adiar transmissões de controlo.
+		this->last_rx_ms_ = millis();
 		dataShow(0, true);
 		dataRX[0] = esphome::uart::UARTDevice::read();
 		if (dataRX[0] != 0xBB) {
 			dataShow(0,0);
 			return;
 		}
+
+		// Mantemos os pequenos delays que já se mostraram estáveis no KUBO.
 		delay(5);
 		dataRX[1] = esphome::uart::UARTDevice::read();
 		delay(5);
@@ -86,22 +92,41 @@ void tclacClimate::loop() {
 		delay(5);
 		dataRX[4] = esphome::uart::UARTDevice::read();
 
-		esphome::uart::UARTDevice::read_array(dataRX+5, dataRX[4]+1);
-		byte check = getChecksum(dataRX, sizeof(dataRX));
-
-		if (check != dataRX[60]) {
-			ESP_LOGD("TCL", "Invalid checksum %x", check);
-			tclacClimate::dataShow(0,0);
+		// Comprimentos válidos conhecidos: 61, 65 e 68 bytes totais.
+		// Validar antes do read_array evita overflow se houver ruído na UART.
+		if (dataRX[4] != 0x37 && dataRX[4] != 0x3B && dataRX[4] != 0x3E) {
+			ESP_LOGW("TCL", "Bad frame length 0x%02X, dropped", dataRX[4]);
+			while (esphome::uart::UARTDevice::available() > 0)
+				esphome::uart::UARTDevice::read();
+			dataShow(0,0);
 			return;
-		} 
-		tclacClimate::dataShow(0,0);
-		tclacClimate::readData();
+		}
+
+		if (!esphome::uart::UARTDevice::read_array(dataRX + 5, dataRX[4] + 1)) {
+			ESP_LOGW("TCL", "Frame read timeout, dropped");
+			dataShow(0,0);
+			return;
+		}
+
+		this->last_rx_ms_ = millis();
+
+		const size_t frame_size = static_cast<size_t>(dataRX[4]) + 6;
+		byte check = getChecksum(dataRX, frame_size);
+		if (check != dataRX[frame_size - 1]) {
+			ESP_LOGD("TCL", "Invalid checksum %x", check);
+			dataShow(0,0);
+			return;
+		}
+
+		dataShow(0,0);
+		readData();
 	}
 }
 
 void tclacClimate::update() {
 	tclacClimate::dataShow(1,1);
 	this->esphome::uart::UARTDevice::write_array(poll, sizeof(poll));
+	this->poll_sent_ms_ = millis();
 	tclacClimate::dataShow(1,0);
 }
 
@@ -111,17 +136,20 @@ void tclacClimate::readData() {
 	target_temperature = (dataRX[FAN_SPEED_POS] & SET_TEMP_MASK) + 16;
 
 	if (dataRX[MODE_POS] & ( 1 << 4)) {
+		// O bit 0x20 pertence ao estado do display, não ao modo do AC.
+		// Separá-lo impede que desligar o display faça COOL/HEAT parecer AUTO.
+		this->display_status_ = (dataRX[MODE_POS] & DISPLAY_BIT) != 0;
 		uint8_t modeswitch = MODE_MASK & dataRX[MODE_POS];
 		uint8_t fanspeedswitch = FAN_SPEED_MASK & dataRX[FAN_SPEED_POS];
 		uint8_t swingmodeswitch = SWING_MODE_MASK & dataRX[SWING_POS];
 
 		switch (modeswitch) {
-			case MODE_AUTO: mode = climate::CLIMATE_MODE_AUTO; break;
+			case MODE_AUTO: mode = climate::CLIMATE_MODE_HEAT_COOL; break;
 			case MODE_COOL: mode = climate::CLIMATE_MODE_COOL; break;
 			case MODE_DRY: mode = climate::CLIMATE_MODE_DRY; break;
 			case MODE_FAN_ONLY: mode = climate::CLIMATE_MODE_FAN_ONLY; break;
 			case MODE_HEAT: mode = climate::CLIMATE_MODE_HEAT; break;
-			default: mode = climate::CLIMATE_MODE_AUTO;
+			default: mode = climate::CLIMATE_MODE_HEAT_COOL;
 		}
 
 		if ( dataRX[FAN_QUIET_POS] & FAN_QUIET) {
@@ -167,38 +195,58 @@ void tclacClimate::readData() {
 }
 
 void tclacClimate::control(const ClimateCall &call) {
-    // CORREÇÃO: mode e swing_mode não são opcionais nesta classe base
-	if (call.get_mode().has_value()){
+	// Não reenviar comandos que não alteram o estado conhecido.
+	bool changed = false;
+	if (call.get_mode().has_value() && call.get_mode().value() != this->mode)
+		changed = true;
+	if (call.get_target_temperature().has_value() &&
+		(int) call.get_target_temperature().value() != (int) this->target_temperature)
+		changed = true;
+	if (call.get_fan_mode().has_value() &&
+		(!this->fan_mode.has_value() || call.get_fan_mode().value() != this->fan_mode.value()))
+		changed = true;
+	if (call.get_swing_mode().has_value() && call.get_swing_mode().value() != this->swing_mode)
+		changed = true;
+	if (call.get_preset().has_value() &&
+		(!this->preset.has_value() || call.get_preset().value() != this->preset.value()))
+		changed = true;
+
+	if (!changed) {
+		ESP_LOGD("TCL", "Climate command has no changes, skipped");
+		return;
+	}
+
+	if (call.get_mode().has_value()) {
 		switch_climate_mode = call.get_mode().value();
 	} else {
-		switch_climate_mode = mode; 
+		switch_climate_mode = mode;
 	}
-	
-	if (call.get_preset().has_value()){
+
+	if (call.get_preset().has_value()) {
 		switch_preset = call.get_preset().value();
 	} else {
 		switch_preset = preset.value_or(ClimatePreset::CLIMATE_PRESET_NONE);
 	}
-	
-	if (call.get_fan_mode().has_value()){
+
+	if (call.get_fan_mode().has_value()) {
 		switch_fan_mode = call.get_fan_mode().value();
 	} else {
 		switch_fan_mode = fan_mode.value_or(climate::CLIMATE_FAN_AUTO);
 	}
-	
-	if (call.get_swing_mode().has_value()){
+
+	if (call.get_swing_mode().has_value()) {
 		switch_swing_mode = call.get_swing_mode().value();
 	} else {
 		switch_swing_mode = swing_mode;
 	}
-	
+
 	if (call.get_target_temperature().has_value()) {
-		target_temperature_set = 31-(int)call.get_target_temperature().value();
+		target_temperature_set = 31 - (int) call.get_target_temperature().value();
 	} else {
 		float temp = std::isnan(target_temperature) ? 18.0f : target_temperature;
-		target_temperature_set = 31-(int)temp;
+		target_temperature_set = 31 - (int) temp;
 	}
-	
+
 	is_call_control = true;
 	takeControl();
 	allow_take_control = true;
@@ -236,9 +284,12 @@ void tclacClimate::takeControl() {
 			dataTX[7] += 0b00000000;
 			dataTX[8] += 0b00000000;
 			break;
-		case climate::CLIMATE_MODE_AUTO:
+		case climate::CLIMATE_MODE_HEAT_COOL:
 			dataTX[7] += 0b00000100;
 			dataTX[8] += 0b00001000;
+			break;
+		case climate::CLIMATE_MODE_AUTO:
+			// Não usado: o AUTO TCL é representado por HEAT_COOL.
 			break;
 		case climate::CLIMATE_MODE_COOL:
 			dataTX[7] += 0b00000100;
@@ -387,9 +438,49 @@ void tclacClimate::takeControl() {
 
 void tclacClimate::sendData(byte * message, byte size) {
 	tclacClimate::dataShow(1,1);
-	this->esphome::uart::UARTDevice::write_array(message, size);
-	ESP_LOGD("TCL", "Message to TCL sended...");
+	this->tx_size_ = size;
+
+	for (uint8_t k = 0; k < TX_REPEAT; k++) {
+		if (k == 0) {
+			this->try_send_frame_(0, TX_MAX_DEFERS);
+		} else {
+			this->set_timeout(k * TX_REPEAT_SPACING_MS, [this, k]() {
+				this->try_send_frame_(k, TX_MAX_DEFERS);
+			});
+		}
+	}
+
+	ESP_LOGD("TCL", "Message queued after UART quiet check");
 	tclacClimate::dataShow(1,0);
+}
+
+bool tclacClimate::bus_quiet_() {
+	const uint32_t now = millis();
+
+	if (esphome::uart::UARTDevice::available() > 0)
+		return false;
+
+	if (now - this->last_rx_ms_ < BUS_QUIET_MS)
+		return false;
+
+	// Depois de um poll, aguardar o início da resposta do AC antes de falar.
+	if (now - this->poll_sent_ms_ < POLL_RESPONSE_WINDOW_MS &&
+		(int32_t) (this->last_rx_ms_ - this->poll_sent_ms_) < 0)
+		return false;
+
+	return true;
+}
+
+void tclacClimate::try_send_frame_(uint8_t attempt, uint8_t defers_left) {
+	if (!this->bus_quiet_() && defers_left > 0) {
+		this->set_timeout(BUS_QUIET_MS, [this, attempt, defers_left]() {
+			this->try_send_frame_(attempt, defers_left - 1);
+		});
+		return;
+	}
+
+	this->esphome::uart::UARTDevice::write_array(this->dataTX, this->tx_size_);
+	this->esphome::uart::UARTDevice::flush();
 }
 
 String tclacClimate::getHex(byte *message, byte size) {
