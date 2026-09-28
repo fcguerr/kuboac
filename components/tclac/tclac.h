@@ -18,14 +18,25 @@ namespace tclac {
 
 #define SET_TEMP_MASK	0b00001111
 
+// UART/protocolo: o bit 0x20 do byte de modo é o estado do display,
+// não faz parte do modo de funcionamento do AC.
 #define MODE_POS		7
-#define MODE_MASK		0b00111111
+#define DISPLAY_BIT		0b00100000
+#define MODE_MASK		0b00001111
 
-#define MODE_AUTO		0b00110101
-#define MODE_COOL		0b00110001
-#define MODE_DRY		0b00110011
-#define MODE_FAN_ONLY	0b00110010
-#define MODE_HEAT		0b00110100
+#define MODE_AUTO		0b00000101
+#define MODE_COOL		0b00000001
+#define MODE_DRY		0b00000011
+#define MODE_FAN_ONLY	0b00000010
+#define MODE_HEAT		0b00000100
+
+// Robustez UART. Mantemos um único envio por comando no KUBO;
+// o mecanismo de espera evita colisões com respostas do AC.
+#define TX_REPEAT				1
+#define TX_REPEAT_SPACING_MS	200
+#define BUS_QUIET_MS			25
+#define POLL_RESPONSE_WINDOW_MS	400
+#define TX_MAX_DEFERS			12
 
 #define FAN_SPEED_POS	8
 #define FAN_QUIET_POS	33
@@ -88,8 +99,8 @@ class tclacClimate : public climate::Climate, public esphome::uart::UARTDevice, 
 		byte checksum;
 		// dataTX с управлением состоит из 38 байт
 		byte dataTX[38];
-		// А dataRX по прежнему из 61 байта
-		byte dataRX[61];
+		// Algumas variantes TCL/KUBO usam frames de 61, 65 ou 68 bytes.
+		byte dataRX[68];
 		// Команда запроса состояния
 		byte poll[8] = {0xBB,0x00,0x01,0x04,0x02,0x01,0x00,0xBD};
 		// Инициализация и начальное наполнение переменных состоянй переключателей
@@ -104,6 +115,14 @@ class tclacClimate : public climate::Climate, public esphome::uart::UARTDevice, 
 		int target_temperature_set = 0;
 		uint8_t switch_climate_mode = 0;
 		bool allow_take_control = false;
+
+		// Estado da linha UART para evitar colisões TX/RX.
+		uint32_t last_rx_ms_ = 0;
+		uint32_t poll_sent_ms_ = 0;
+		uint8_t tx_size_ = 0;
+
+		bool bus_quiet_();
+		void try_send_frame_(uint8_t attempt, uint8_t defers_left);
 		
 		esphome::climate::ClimateTraits traits_;
 		
